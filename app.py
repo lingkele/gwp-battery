@@ -13,12 +13,15 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 from gwp.battery import BatteryState, MouseBattery
+from gwp.panel import Panel
 
 APP_NAME = "GProBattery"
 APP_TITLE = "罗技鼠标电量"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "settings.json"
+HISTORY_FILE = CONFIG_DIR / "history.json"
+HISTORY_KEEP_SECONDS = 2 * 24 * 3600
 
 COLOR_GOOD = "#3DDC84"
 COLOR_MID = "#FFB020"
@@ -30,6 +33,18 @@ FONT_CANDIDATES = [
     r"C:\Windows\Fonts\arialbd.ttf",
     r"C:\Windows\Fonts\seguisb.ttf",
 ]
+
+HELP_TEXT = (
+    "左键单击托盘图标（或双击）打开面板，右键打开菜单。\n\n"
+    "· 面板里有大号电量表盘、最近一小时的电量曲线，以及低电量提醒、\n"
+    "  开机自启两个开关；关掉窗口后程序仍在托盘运行。\n"
+    "· 图标在任务栏右下角；如果看不到，点任务栏的 ∧ 打开隐藏图标区，\n"
+    "  把它拖到任务栏上即可常驻显示。\n"
+    "· 「开机自动启动」会写入当前用户的启动项，无需管理员权限。\n"
+    "· 直接读取接收器，无需安装 Logitech G HUB。\n\n"
+    "支持通过 Lightspeed / Bolt / Unifying 接收器连接的罗技鼠标，\n"
+    "也支持用 USB 线直连的型号。"
+)
 
 
 def load_settings() -> dict:
@@ -47,6 +62,36 @@ def save_settings(settings: dict) -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_history() -> list[tuple[float, int]]:
+    """Read the stored ``[timestamp, percent]`` samples, dropping stale ones."""
+    cutoff = time.time() - HISTORY_KEEP_SECONDS
+    samples: list[tuple[float, int]] = []
+    try:
+        raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return samples
+    if not isinstance(raw, list):
+        return samples
+    for item in raw:
+        try:
+            ts, pct = float(item[0]), int(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if ts >= cutoff and 0 <= pct <= 100:
+            samples.append((ts, pct))
+    samples.sort(key=lambda sample: sample[0])
+    return samples
+
+
+def save_history(samples: list[tuple[float, int]]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = [[round(ts, 1), pct] for ts, pct in samples[-2880:]]
+        HISTORY_FILE.write_text(json.dumps(payload), encoding="utf-8")
     except OSError:
         pass
 
@@ -159,7 +204,68 @@ class TrayApp:
         self._ready = False
         self._low_notified = False
         self._was_full = False
+        self.history = load_history()
+        self.history_writes = 0
+        self.updated_at = 0.0
+        self.panel = Panel(self)
         self.icon = pystray.Icon(APP_NAME, self._render(), APP_TITLE, menu=self._build_menu())
+
+    # -- shared view of the current reading ---------------------------------
+    def render_icon(self) -> Image.Image:
+        return self._render()
+
+    def snapshot(self) -> dict:
+        """Everything the panel needs, safe to read from another thread."""
+        state = self.state
+        return {
+            "state": state,
+            "history": list(self.history[-360:]),
+            "updated": self.updated_at,
+            "detail": state.detail or "HID++",
+            "accent": level_color(state.percent),
+            "notify_low": bool(self.settings.get("notify_low", True)),
+            "autostart": is_autostart_enabled(),
+        }
+
+    def refresh_now(self) -> None:
+        self._wake.set()
+
+    def quit_app(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        save_history(self.history)
+        try:
+            self.mouse.close()
+        except Exception:
+            pass
+        self.panel.stop()
+        try:
+            self.icon.stop()
+        except Exception:
+            pass
+
+    def show_help(self) -> None:
+        self.panel.show_help(HELP_TEXT)
+
+    def set_notify_low(self, enabled: bool) -> None:
+        self.settings["notify_low"] = bool(enabled)
+        if enabled:
+            self._low_notified = False
+        save_settings(self.settings)
+        self._refresh_menu()
+
+    def set_autostart(self, enabled: bool) -> None:
+        try:
+            set_autostart(bool(enabled))
+        except OSError:
+            pass
+        self._refresh_menu()
+
+    def _refresh_menu(self) -> None:
+        try:
+            self.icon.update_menu()
+        except Exception:
+            pass
 
     # -- rendering ----------------------------------------------------------
     def _render(self) -> Image.Image:
@@ -219,6 +325,8 @@ class TrayApp:
 
     def _on_state(self, state: BatteryState) -> None:
         self.state = state
+        self.updated_at = time.time()
+        self._record(state)
         self._apply()
 
         if state.present and state.percent is not None:
@@ -232,6 +340,23 @@ class TrayApp:
             if state.full and not self._was_full:
                 self.notify("电池已充满", state.name or APP_TITLE)
             self._was_full = state.full
+
+        self.panel.push(self.snapshot())
+
+    def _record(self, state: BatteryState) -> None:
+        if not state.present or state.percent is None:
+            return
+        now = time.time()
+        if self.history and now - self.history[-1][0] < 20:
+            self.history[-1] = (now, state.percent)
+        else:
+            self.history.append((now, state.percent))
+        cutoff = now - HISTORY_KEEP_SECONDS
+        while self.history and self.history[0][0] < cutoff:
+            self.history.pop(0)
+        self.history_writes += 1
+        if self.history_writes % 5 == 0:
+            save_history(self.history)
 
     def notify(self, message: str, title: str) -> None:
         try:
@@ -249,43 +374,25 @@ class TrayApp:
         self._apply()
 
     def _toggle_low(self, icon, item):
-        self.settings["notify_low"] = not self.settings.get("notify_low", True)
-        if self.settings["notify_low"]:
-            self._low_notified = False
-        save_settings(self.settings)
-        self.icon.update_menu()
+        self.set_notify_low(not self.settings.get("notify_low", True))
 
     def _toggle_autostart(self, icon, item):
-        try:
-            set_autostart(not is_autostart_enabled())
-        except OSError:
-            pass
-        self.icon.update_menu()
+        self.set_autostart(not is_autostart_enabled())
+
+    def _open_panel(self, icon=None, item=None):
+        self.panel.open()
 
     def _help(self, icon, item):
-        message = (
-            "右键托盘图标可以查看电量和设置。\n\n"
-            "· 图标在任务栏右下角；如果看不到，点任务栏的 ∧ 打开隐藏图标区，\n"
-            "  把「79」拖到任务栏上即可常驻显示。\n"
-            "· 「开机自动启动」会写入当前用户的启动项，无需管理员权限。\n"
-            "· 直接读取接收器，无需安装 Logitech G HUB。\n\n"
-            "支持通过 Lightspeed / Bolt / Unifying 接收器连接的罗技鼠标，\n"
-            "也支持用 USB 线直连的型号。"
-        )
-        ctypes.windll.user32.MessageBoxW(None, message, "罗技鼠标电量 · 使用说明", 0x40)
+        self.show_help()
 
     def _quit(self, icon, item):
-        self._stop.set()
-        self._wake.set()
-        try:
-            self.mouse.close()
-        finally:
-            icon.stop()
+        self.quit_app()
 
     def _build_menu(self) -> pystray.Menu:
         return pystray.Menu(
             pystray.MenuItem(lambda item: self._status_line(), None, enabled=False),
-            pystray.MenuItem("立即刷新", self._refresh, default=True),
+            pystray.MenuItem("打开面板", self._open_panel, default=True),
+            pystray.MenuItem("立即刷新", self._refresh),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示百分比", lambda i, it: self._set_style("percent"),
                              checked=lambda item: self.settings.get("style") == "percent", radio=True),
@@ -305,7 +412,15 @@ class TrayApp:
         self._wake.set()
         if not self.settings.get("first_run_done"):
             threading.Thread(target=self._first_run_hint, daemon=True).start()
-        self.icon.run(setup=self._on_icon_ready)
+        # Tk owns the main thread; pystray's own loop runs beside it.
+        threading.Thread(
+            target=self.icon.run, kwargs={"setup": self._on_icon_ready}, daemon=True
+        ).start()
+        self.panel.run()
+        try:
+            self.icon.stop()
+        except Exception:
+            pass
 
     def _on_icon_ready(self, icon):
         self._ready = True
@@ -313,9 +428,10 @@ class TrayApp:
         self._apply()
 
     def _first_run_hint(self):
-        time.sleep(3.0)
-        self.notify("已在托盘运行。右键图标查看电量；看不到图标就点任务栏的 ∧ 把它拖出来。",
+        time.sleep(2.0)
+        self.notify("已在托盘运行。左键点击图标查看面板；看不到图标就点任务栏的 ∧ 把它拖出来。",
                     APP_TITLE)
+        self.panel.open()
         self.settings["first_run_done"] = True
         save_settings(self.settings)
 
@@ -326,9 +442,21 @@ def single_instance() -> bool:
     return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
 
 
+def enable_dpi_awareness() -> None:
+    """Crisp Tk text on scaled displays; harmless when already set."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main() -> int:
     if not single_instance():
         return 0
+    enable_dpi_awareness()
     # Keep the startup entry pointing at wherever the app lives now.
     if is_autostart_enabled():
         try:

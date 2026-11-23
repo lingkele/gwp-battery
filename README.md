@@ -1,28 +1,35 @@
 # 罗技鼠标电量托盘 GProBattery
 
-给罗技无线鼠标用的 Windows 托盘电量显示。直接通过 HID++ 2.0 跟接收器通信，
-**不需要安装 Logitech G HUB**，也不改动鼠标的任何设置。
+给罗技无线鼠标用的 Windows 托盘电量显示，带一个暗色面板。直接通过 HID++ 2.0
+跟接收器通信，**不需要安装 Logitech G HUB**，也不改动鼠标的任何设置。
 
 已在 **G Pro Wireless（GWP）** 上实测：接收器 PID `C539`，读到
 `G Pro Wireless Gaming Mouse · 79% · 3981 mV`。
 
 ![托盘图标](tray-demo.png)
 
+## 面板
+
+左键单击托盘图标打开面板：大号电量表盘、最近一小时的电量曲线，
+以及低电量提醒、开机自启两个开关。关掉窗口后程序仍在托盘运行。
+
+![面板](panel-demo.png)
+
 ## 直接使用
 
 从 [Releases](https://github.com/lingkele/gwp-battery/releases) 下载 `GProBattery.exe`
-（单文件，16 MB，不需要装 Python），双击运行即可；也可以按下面的「自己构建」从源码打包。
+（单文件，约 16 MB，不需要装 Python），双击运行即可；也可以按下面的「自己构建」从源码打包。
 
 托盘会出现电量图标（数字 = 电量百分比，颜色随电量变化：绿 > 50%，黄 20–50%，红 ≤ 20%）。
 
 - 鼠标悬停：看鼠标型号、电量、充放电状态、电压；
-- 左键单击：立即刷新；
-- 右键：刷新 / 切换「百分比 ↔ 电池图标」/ 低电量提醒 / 开机自启 / 使用说明 / 退出。
+- 左键单击：打开面板（双击同样效果）；
+- 右键：打开面板 / 刷新 / 切换「百分比 ↔ 电池图标」/ 低电量提醒 / 开机自启 / 使用说明 / 退出。
 
 开机自启默认关闭，需要的话在右键菜单里勾选即可（写当前用户启动项，不用管理员）。
 
 > **看不到图标？** Windows 11 会把新图标放进隐藏区。点任务栏右下角的 `∧`，
-> 把写着 `79` 的图标拖到任务栏上就会常驻。程序首次启动也会弹一次提示。
+> 把写着 `79` 的图标拖到任务栏上就会常驻。程序首次启动也会弹一次提示并打开面板。
 
 程序是单实例的，重复双击不会再开第二个。
 
@@ -72,12 +79,15 @@ cd gwp-battery
 ## 文件
 
 ```
-app.py            托盘 UI、轮询、开机自启、设置
+app.py            托盘 UI、轮询、开机自启、设置、电量历史
 gwp/hidpp.py      HID++ 2.0 传输（短/长报文、feature 发现、ping）
 gwp/battery.py    电量解析、电压→百分比曲线
+gwp/panel.py      桌面面板（Tkinter：表盘、曲线、开关）
+tools/capture.py  调试用：把窗口截成 PNG，不打扰当前桌面
 assets/app.ico    程序图标
 build.ps1         一键构建
 dist/GProBattery.exe
 ```
 
-设置保存在 `%APPDATA%\GProBattery\settings.json`。
+设置保存在 `%APPDATA%\GProBattery\settings.json`，最近两天的电量历史在同目录的
+`history.json`（面板里的曲线来自它）。

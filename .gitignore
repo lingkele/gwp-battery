@@ -6,3 +6,7 @@ dist/
 *.spec
 .idea/
 .vscode/
+*.log
+layout.txt
+panel*.png
+!panel-demo.png
