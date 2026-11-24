@@ -31,7 +31,7 @@ SWP_NOSIZE = 0x0001
 SWP_NOZORDER = 0x0004
 
 
-def find_windows(prefix: str, max_width: int = 600) -> list[int]:
+def find_windows(prefix: str, max_width: int = 1000) -> list[int]:
     found: list[int] = []
 
     def callback(hwnd, _param):

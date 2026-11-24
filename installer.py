@@ -10,6 +10,7 @@ an unattended script); ``--uninstall`` is handled by the bundled uninstaller.
 """
 from __future__ import annotations
 
+import queue
 import shutil
 import subprocess
 import sys
@@ -182,6 +183,8 @@ class SetupWindow:
         self.root.resizable(False, False)
         self.root.configure(bg="#f4f5f7")
         self.busy = False
+        self.done = False
+        self._events: queue.Queue = queue.Queue()
         self._build()
 
     def _build(self) -> None:
@@ -227,37 +230,61 @@ class SetupWindow:
                                        width=8)
         self.close_button.pack(side="right", padx=(0, 8))
 
+        self.root.bind("<Return>", lambda _event: self._on_install())
+
     def _report(self, text: str) -> None:
-        self.status.configure(text=text)
-        self.root.update_idletasks()
+        """Called from the install thread — only touches the queue."""
+        self._events.put(("status", text))
+
+    def _drain(self) -> None:
+        """Main-thread only: apply queued events, then reschedule."""
+        try:
+            while True:
+                kind, payload = self._events.get_nowait()
+                if kind == "status":
+                    self.status.configure(text=payload)
+                elif kind == "done":
+                    self._done(payload)
+                elif kind == "error":
+                    self._failed(payload)
+        except queue.Empty:
+            pass
+        self.root.after(80, self._drain)
 
     def _on_install(self) -> None:
-        if self.busy:
+        if self.busy or self.done:
             return
         self.busy = True
         self.install_button.state(["disabled"])
-        target = install_dir() / "GProBattery.exe"
+        self.close_button.configure(text="隐藏")
+        # read the checkboxes here: Tk variables must not be read off-thread
+        autostart = bool(self.autostart.get())
+        desktop = bool(self.desktop.get())
 
         def work() -> None:
             try:
-                install(bool(self.autostart.get()), bool(self.desktop.get()), self._report)
+                target = install(autostart, desktop, self._report)
             except Exception as exc:            # noqa: BLE001 - show it, never crash
-                self.root.after(0, lambda: self._failed(str(exc)))
+                self._events.put(("error", str(exc)))
                 return
-            self.root.after(0, lambda: self._done(target))
+            self._events.put(("done", Path(target)))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _done(self, exe: Path) -> None:
+    def _done(self, folder: Path) -> None:
         self.busy = False
-        self.status.configure(text=f"安装完成，已放到 {exe.parent}")
-        self.install_button.configure(text="运行", command=lambda: self._launch(exe))
+        self.done = True
+        self.status.configure(text=f"安装完成，已放到 {folder}")
+        self.install_button.configure(text="运行",
+                                      command=lambda: self._launch(folder / "GProBattery.exe"))
         self.install_button.state(["!disabled"])
+        self.close_button.configure(text="关闭")
 
     def _failed(self, message: str) -> None:
         self.busy = False
         self.status.configure(text=f"安装失败：{message}")
         self.install_button.state(["!disabled"])
+        self.close_button.configure(text="关闭")
 
     def _launch(self, exe: Path) -> None:
         try:
@@ -272,6 +299,7 @@ class SetupWindow:
         self.root.destroy()
 
     def run(self) -> int:
+        self.root.after(80, self._drain)
         self.root.mainloop()
         return 0
 

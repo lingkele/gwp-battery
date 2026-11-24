@@ -10,6 +10,7 @@ Ships inside the installation folder; deletes itself last through a detached
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -79,6 +80,9 @@ def schedule_delete(folder: Path) -> None:
 
 def uninstall(keep_settings: bool, report=lambda text: None) -> None:
     folder = install_dir()
+    if not getattr(sys, "frozen", False) and (folder / "app.py").exists():
+        # running from the source tree: deleting it would destroy the checkout
+        raise RuntimeError("源码目录里不执行卸载，请用安装目录中的卸载程序")
     report("正在关闭程序…")
     kill_running()
     report("正在删除快捷方式…")
@@ -103,6 +107,7 @@ class UninstallWindow:
         self.root.resizable(False, False)
         self.root.configure(bg="#f4f5f7")
         self.busy = False
+        self._events: queue.Queue = queue.Queue()
         self._build()
 
     def _build(self) -> None:
@@ -131,31 +136,51 @@ class UninstallWindow:
                    width=8).pack(side="right", padx=(0, 8))
 
     def _report(self, text: str) -> None:
-        self.status.configure(text=text)
-        self.root.update_idletasks()
+        """Called from the worker thread — only touches the queue."""
+        self._events.put(("status", text))
+
+    def _drain(self) -> None:
+        """Main-thread only: apply queued events, then reschedule."""
+        try:
+            while True:
+                kind, payload = self._events.get_nowait()
+                if kind == "status":
+                    self.status.configure(text=payload)
+                elif kind == "error":
+                    self._failed(payload)
+                elif kind == "done":
+                    self._finish()
+        except queue.Empty:
+            pass
+        self.root.after(80, self._drain)
 
     def _on_uninstall(self) -> None:
         if self.busy:
             return
         self.busy = True
         self.go.state(["disabled"])
+        keep = bool(self.keep.get())      # read the Tk variable on the main thread
 
         def work() -> None:
             try:
-                uninstall(bool(self.keep.get()), self._report)
+                uninstall(keep, self._report)
             except Exception as exc:      # noqa: BLE001
-                self.root.after(0, lambda: self.status.configure(text=f"卸载失败：{exc}"))
-                self.root.after(0, lambda: self.go.state(["!disabled"]))
+                self._events.put(("error", str(exc)))
                 return
-            self.root.after(0, self._finish)
+            self._events.put(("done", None))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _failed(self, message: str) -> None:
+        self.status.configure(text=f"卸载失败：{message}")
+        self.go.state(["!disabled"])
 
     def _finish(self) -> None:
         self.status.configure(text="已卸载，剩余文件会在几秒内删除。")
         self.root.after(1200, self.root.destroy)
 
     def run(self) -> int:
+        self.root.after(80, self._drain)
         self.root.mainloop()
         return 0
 
