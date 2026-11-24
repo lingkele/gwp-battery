@@ -18,7 +18,7 @@ from gwp.theme import level_color
 
 APP_NAME = "GProBattery"
 APP_TITLE = "设备电量"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "settings.json"

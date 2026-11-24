@@ -39,6 +39,6 @@ Invoke-PyInstaller -What "setup" -Arguments @(
 
 Write-Host ""
 Write-Host "done ->" -ForegroundColor Green
-Write-Host "  dist\GProBattery.exe            (便携版)"
-Write-Host "  dist\GProBatteryUninstall.exe   (卸载程序)"
-Write-Host "  dist\GProBattery-Setup.exe      (安装包)"
+Write-Host "  dist\GProBattery.exe            (portable app)"
+Write-Host "  dist\GProBatteryUninstall.exe   (uninstaller)"
+Write-Host "  dist\GProBattery-Setup.exe      (installer)"

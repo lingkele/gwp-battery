@@ -164,20 +164,31 @@ class Panel:
                 pass
             return
 
+        # Wake-ups (open/close/toggle) arrive as empty dicts and must never
+        # shadow a real payload queued right before them: a click on a device
+        # pushes a fresh snapshot and then opens the detail page, and dropping
+        # that snapshot would leave the panel showing the previous device until
+        # the next poll (or a manual refresh).
         payload = None
+        help_text = None
         while True:
             try:
-                payload = self._queue.get_nowait()
+                item = self._queue.get_nowait()
             except queue.Empty:
                 break
-        if payload:
-            if "help" in payload:
-                self._show_help(str(payload["help"]))
+            if not item:
+                continue
+            if "help" in item:
+                help_text = str(item["help"])
             else:
-                try:
-                    self._apply(payload)
-                except Exception:
-                    pass
+                payload = item
+        if help_text is not None:
+            self._show_help(help_text)
+        if payload:
+            try:
+                self._apply(payload)
+            except Exception:
+                pass
 
         if self._wanted_page != self._page:
             self._set_page(self._wanted_page)
