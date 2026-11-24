@@ -90,7 +90,7 @@ gwp/devices.py     设备模型：把 HID++ 与蓝牙电池合并成统一列表
 gwp/bluetooth.py   CfgMgr32 读 Windows 蓝牙电池属性
 gwp/theme.py       颜色分级（绿 / 黄 / 红 / 灰）
 gwp/panel.py       桌面面板（Tkinter）：表盘、曲线、所有设备页、开关
-tools/             构建与截图调试脚本（capture.py 可离屏截窗口）
+tools/             构建、截图与冒烟测试（capture.py 离屏截窗口，panel/click/setup/uninstall_smoke.py）
 assets/app.ico     程序图标
 build.ps1          一键构建三个 exe
 ```
