@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import re
 import time
 import tkinter as tk
 from typing import Any
@@ -291,14 +292,36 @@ class Panel:
         if self._visible:
             # Both pages have different heights, so let Tk re-fit the window
             # and park it back around the same top-left corner.
-            x, y = root.winfo_rootx(), root.winfo_rooty()
+            #
+            # The corner comes from wm geometry, not from winfo_rootx/y: those
+            # report the client area, which sits a border and a title bar below
+            # and right of the frame, so feeding them into "+x+y" walked the
+            # window down and right on every page change.
+            x, y = self._window_pos()
             root.update_idletasks()
             root.geometry("")
             root.update_idletasks()
-            x = max(0, min(x, root.winfo_screenwidth() - root.winfo_reqwidth()))
-            y = max(0, min(y, root.winfo_screenheight() - root.winfo_reqheight()))
+            width = root.winfo_width()
+            height = root.winfo_height()
+            x = max(0, min(x, root.winfo_screenwidth() - width))
+            y = max(0, min(y, root.winfo_screenheight() - height))
             root.geometry(f"+{x}+{y}")
+            self._log(f"park +{x}+{y} size {width}x{height}")
         self._apply_current_page()
+
+    def _window_pos(self) -> tuple[int, int]:
+        """Top-left corner of the window frame, in wm geometry units."""
+        root = self._root
+        if root is None:
+            return 0, 0
+        try:
+            geometry = root.geometry()
+        except Exception:
+            return 0, 0
+        match = re.search(r"([+-]\d+)([+-]\d+)$", geometry)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return root.winfo_rootx(), root.winfo_rooty()
 
     def _apply_current_page(self) -> None:
         payload = self._payload

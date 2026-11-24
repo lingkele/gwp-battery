@@ -23,7 +23,7 @@ from tkinter import ttk
 
 APP_NAME = "GProBattery"
 APP_TITLE = "设备电量"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 APP_DESC = "罗技无线鼠标和键盘的电量，常驻托盘并带一个电量面板。"
 PAYLOAD_FILES = ("GProBattery.exe", "GProBatteryUninstall.exe")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
