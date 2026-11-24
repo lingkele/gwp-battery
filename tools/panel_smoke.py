@@ -1,7 +1,8 @@
-"""Smoke test for the panel lifecycle: open, hide, reopen, stop.
+"""Smoke test for the panel lifecycle: open, hide, reopen, devices page, stop.
 
 Runs the real Panel on the main thread with a stub app, so it exercises the
-queue, the show/hide pump and the shutdown path without touching hardware.
+queue, the show/hide pump, the page switch and the shutdown path without
+touching hardware.
 """
 from __future__ import annotations
 
@@ -12,26 +13,37 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from gwp.battery import BatteryState  # noqa: E402
+from gwp.devices import DeviceState  # noqa: E402
 from gwp.panel import Panel  # noqa: E402
 
 
 class StubApp:
     def __init__(self) -> None:
-        self.state = BatteryState(present=True, percent=62, charging=False,
-                                  voltage_mv=3870, name="G Pro Wireless Gaming Mouse",
-                                  detail="HID++ 0x1001")
+        self.devices = [
+            DeviceState(id="hidpp:50489:01", name="G Pro Wireless Gaming Mouse",
+                        kind="mouse", percent=62, charging=False, voltage_mv=3870,
+                        present=True, transport="receiver",
+                        detail="接收器 1 号位 · HID++ 0x1001"),
+            DeviceState(id="bt:BTHLE\\DEV_F1551F37BD9A", name="Varmilo VD-1",
+                        kind="keyboard", percent=100, charging=False,
+                        present=True, transport="bluetooth",
+                        detail="蓝牙 · Windows 电池服务"),
+        ]
+        self.current = self.devices[0]
         self.notify_low = True
         self.autostart = False
         self.calls: list[str] = []
 
     def snapshot(self) -> dict:
+        state = self.current
         return {
-            "state": self.state,
+            "state": state,
+            "devices": self.devices,
+            "current": state.id,
             "history": [(time.time() - 60 * i, 60 + i % 5) for i in range(30)],
             "updated": time.time(),
-            "detail": self.state.detail,
-            "accent": "#3DDC84",
+            "detail": state.detail,
+            "accent": state.accent,
             "notify_low": self.notify_low,
             "autostart": self.autostart,
         }
@@ -40,6 +52,12 @@ class StubApp:
         from PIL import Image
 
         return Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+
+    def select_device(self, device_id: str | None) -> None:
+        for device in self.devices:
+            if device.id == device_id:
+                self.current = device
+        self.calls.append(f"select={device_id}")
 
     def refresh_now(self) -> None:
         self.calls.append("refresh")
@@ -71,6 +89,12 @@ def main() -> int:
         panel.open()
         time.sleep(1.2)
         results.append(("opened", panel._visible))
+        results.append(("detail page", panel._page == "detail"))
+
+        panel.open(page="devices")
+        time.sleep(1.0)
+        results.append(("devices page", panel._page == "devices" and panel._visible))
+
         panel.close()
         time.sleep(0.8)
         results.append(("hidden", not panel._visible))
@@ -86,10 +110,10 @@ def main() -> int:
     panel.run()
     elapsed = time.time() - started
 
-    ok = all(passed for _, passed in results) and len(results) == 3 and elapsed < 15
+    ok = all(passed for _, passed in results) and len(results) == 5 and elapsed < 20
     for name, passed in results:
         print(f"{'ok  ' if passed else 'FAIL'} {name}")
-    print(f"{'ok  ' if elapsed < 15 else 'FAIL'} stopped after {elapsed:.1f}s")
+    print(f"{'ok  ' if elapsed < 20 else 'FAIL'} stopped after {elapsed:.1f}s")
     return 0 if ok else 1
 
 

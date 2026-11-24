@@ -1,10 +1,10 @@
-"""Read the battery state of a Logitech mouse over HID++ 2.0."""
+"""Read the battery state of every Logitech mouse that answers HID++ 2.0."""
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from .hidpp import HidppError, Receiver, enumerate_endpoints
+from .hidpp import DIRECT_DEVICE, HidppError, Receiver, enumerate_endpoints
 
 FEATURE_BATTERY_STATUS = 0x1000   # percent + status
 FEATURE_BATTERY_VOLTAGE = 0x1001  # voltage in mV + flags
@@ -42,124 +42,226 @@ class BatteryState:
     voltage_mv: int | None = None
     name: str = ""
     detail: str = ""
+    transport: str = ""          # "receiver" or "usb"
+    key: str = ""                # stable identity: receiver pid + device index
 
     @property
     def status_text(self) -> str:
         if not self.present:
-            return "鼠标未响应"
+            return "未响应"
         if self.full:
             return "已充满"
         if self.charging:
             return "充电中"
         return "放电中"
 
+    @property
+    def label(self) -> str:
+        return self.name or ("罗技鼠标" if self.present else "未发现罗技鼠标")
+
+
+@dataclass
+class _Slot:
+    """A device index that answered on one HID++ endpoint."""
+    key: tuple
+    endpoint: dict
+    dev: int
+    receiver: Receiver
+    name: str = ""
+    transport: str = "receiver"
+    notes: list[str] = field(default_factory=list)
+
 
 class MouseBattery:
-    """Resolves the mouse on a receiver once, then polls its battery."""
+    """Finds every Logitech mouse that answers, then polls their batteries.
+
+    A mouse can sit on a receiver slot (device index 1..6) or be wired straight
+    into USB, where it answers on its own address (0xFF). Both are discovered on
+    the first read and cached; a rescan only happens when nothing answers.
+    """
 
     def __init__(self):
-        self._receiver: Receiver | None = None
-        self._key: tuple | None = None
-        self._device_index: int | None = None
-        self._name: str = ""
+        self._receivers: dict[tuple, Receiver] = {}
+        self._slots: list[_Slot] | None = None
+        self._names: dict[tuple, str] = {}
 
     # -- connection ---------------------------------------------------------
-    def _connect(self) -> Receiver | None:
-        for endpoint in enumerate_endpoints():
-            key = (endpoint["product_id"], endpoint["short"])
-            if self._receiver is not None and key == self._key:
-                return self._receiver
-            try:
-                self._receiver = Receiver(endpoint["short"], endpoint["long"],
-                                          endpoint["product_id"], endpoint["product"])
-            except OSError:
-                self._receiver = None
-                continue
-            self._key = key
-            self._device_index = None
-            self._name = ""
-            return self._receiver
-        self._receiver = None
-        self._key = None
-        return None
+    def _receiver_for(self, endpoint: dict) -> Receiver | None:
+        key = (endpoint["product_id"], endpoint["short"])
+        rx = self._receivers.get(key)
+        if rx is not None:
+            return rx
+        try:
+            rx = Receiver(endpoint["short"], endpoint["long"],
+                          endpoint["product_id"], endpoint["product"])
+        except OSError:
+            return None
+        self._receivers[key] = rx
+        return rx
 
-    def _resolve_device(self, rx: Receiver) -> int | None:
-        for dev in range(1, 7):
-            if rx.ping(dev):
-                return dev
-        return None
+    def _drop_receiver(self, key: tuple):
+        rx = self._receivers.pop(key, None)
+        if rx is not None:
+            rx.close()
+
+    def _has_battery(self, rx: Receiver, dev: int) -> bool:
+        for feature in (FEATURE_UNIFIED_BATTERY, FEATURE_BATTERY_STATUS, FEATURE_BATTERY_VOLTAGE):
+            if rx.feature_index(feature, dev):
+                return True
+        return False
+
+    def _scan(self) -> list[_Slot]:
+        """Ask every endpoint and address who is alive and has a battery."""
+        slots: list[_Slot] = []
+        try:
+            endpoints = enumerate_endpoints()
+        except OSError:
+            return slots
+        for endpoint in endpoints:
+            rx = self._receiver_for(endpoint)
+            if rx is None:
+                continue
+            key = (endpoint["product_id"], endpoint["short"])
+            try:
+                direct = rx.ping(DIRECT_DEVICE)
+            except HidppError:
+                self._drop_receiver(key)
+                continue
+            if direct and self._has_battery(rx, DIRECT_DEVICE):
+                slots.append(_Slot(key, endpoint, DIRECT_DEVICE, rx, transport="usb"))
+                continue      # a wired mouse owns the whole endpoint
+            for dev in range(1, 7):
+                try:
+                    if rx.ping(dev) and self._has_battery(rx, dev):
+                        slots.append(_Slot(key, endpoint, dev, rx))
+                except HidppError:
+                    self._drop_receiver(key)
+                    break
+        return slots
 
     def _read_name(self, rx: Receiver, dev: int) -> str:
+        key = (rx.product_id, dev)
+        cached = self._names.get(key)
+        if cached:
+            return cached
+        name = ""
         index = rx.feature_index(FEATURE_DEVICE_NAME, dev)
-        if not index:
-            return ""
-        head = rx.call(index, 0x00, dev=dev)
-        if not head:
-            return ""
-        count = head[4]
-        chars: list[int] = []
-        while len(chars) < count:
-            chunk = rx.call(index, 0x01, len(chars), dev=dev)
-            if not chunk:
-                break
-            data = chunk[4:20]
-            chars.extend(c for c in data if c)
-            if not any(data):
-                break
-        return bytes(chars[:count]).decode("utf-8", errors="ignore").strip()
+        if index:
+            head = rx.call(index, 0x00, dev=dev)
+            if head:
+                count = head[4]
+                chars: list[int] = []
+                chunk_index = 0
+                while len(chars) < count and chunk_index < 4:
+                    # byte 0 = (chunk << 4) | offset, one chunk is 16 bytes
+                    chunk = rx.call(index, 0x01, chunk_index << 4, dev=dev)
+                    chunk_index += 1
+                    if not chunk:
+                        break
+                    data = [c for c in chunk[4:20] if c]
+                    if not data:
+                        break
+                    chars.extend(data)
+                name = bytes(chars[:count]).decode("utf-8", errors="ignore").strip()
+        if name:            # an empty answer is a hiccup, not a nameless device
+            self._names[key] = name
+        return name
+
+    def _where(self, slot: _Slot) -> str:
+        if slot.transport == "usb":
+            return "USB 直连"
+        return f"接收器 {slot.dev} 号位"
 
     # -- public -------------------------------------------------------------
-    def read(self) -> BatteryState:
-        try:
-            rx = self._connect()
-        except OSError:
-            rx = None
-        if rx is None:
-            return BatteryState(detail="未找到罗技接收器")
+    def read_all(self) -> list[BatteryState]:
+        """Battery of every mouse currently answering."""
+        if not self._slots:
+            self._slots = self._scan()
+        if not self._slots:
+            # the first sweep often lands while the device is still waking up
+            time.sleep(0.25)
+            self._slots = self._scan()
+        if not self._slots:
+            return [BatteryState(detail="未找到罗技鼠标（接收器与 USB 直连都没有响应）")]
 
-        state = BatteryState(detail="接收器在线，鼠标未响应")
+        states = [state for state in (self._poll(slot) for slot in self._slots) if state]
+        if not states:
+            # everything went quiet: re-pair / re-plug may have changed the map
+            self._slots = self._scan()
+            states = [state for state in (self._poll(slot) for slot in self._slots) if state]
+        if not states:
+            return [BatteryState(detail="罗技鼠标没有响应（可能已休眠或断开）")]
+        return states
+
+    def read(self) -> BatteryState:
+        """The mouse worth showing: lowest charge wins, so it warns first."""
+        states = self.read_all()
+        known = [s for s in states if s.percent is not None]
+        if known:
+            return min(known, key=lambda s: s.percent)
+        present = [s for s in states if s.present]
+        return present[0] if present else states[0]
+
+    def _poll(self, slot: _Slot) -> BatteryState | None:
+        rx = slot.receiver
+        state: BatteryState | None = None
         for attempt in range(2):
             try:
-                if self._device_index is None:
-                    self._device_index = self._resolve_device(rx)
-                    if self._device_index is None:
-                        return state
-                state = self._read_battery(rx, self._device_index)
+                if not slot.name:
+                    slot.name = self._read_name(rx, slot.dev)
+                state = self._read_battery(rx, slot)
             except HidppError:
-                self._drop()
-                return BatteryState(detail="与接收器通信失败")
-            if state.percent is not None or not state.present:
+                self._drop_slot(slot)
+                return None
+            if state.percent is not None:
                 return state
             if attempt == 0:
-                # the mouse may have dozed off: dropping the index forces a
-                # fresh ping, which wakes it up
-                self._device_index = None
-                time.sleep(0.25)
+                # the mouse may have dozed off: a fresh ping usually wakes it
+                rx.forget(slot.dev)
+                try:
+                    if not rx.ping(slot.dev):
+                        break
+                except HidppError:
+                    self._drop_slot(slot)
+                    return None
+                time.sleep(0.2)
         return state
 
-    def _read_battery(self, rx: Receiver, dev: int) -> BatteryState:
-        if not self._name:
-            self._name = self._read_name(rx, dev)
+    def _drop_slot(self, slot: _Slot):
+        key = slot.key
+        self._receivers.pop(key, None)
+        rx = slot.receiver
+        try:
+            rx.close()
+        except Exception:
+            pass
+        self._slots = None
+
+    def _read_battery(self, rx: Receiver, slot: _Slot) -> BatteryState:
+        dev = slot.dev
+        where = self._where(slot)
+        key = f"{slot.endpoint['product_id']}:{dev:02x}"
+        common = {"present": True, "name": slot.name, "transport": slot.transport, "key": key}
 
         index = rx.feature_index(FEATURE_UNIFIED_BATTERY, dev)
         if index:
             reply = rx.call(index, 0x01, dev=dev)
             if reply and len(reply) >= 7:
                 percent, status = reply[4], reply[6]
-                return BatteryState(present=True, percent=min(100, percent),
+                return BatteryState(percent=min(100, percent),
                                     charging=status in CHARGING_STATES,
-                                    full=status == FULL_STATE, name=self._name,
-                                    detail="HID++ 0x1004")
+                                    full=status == FULL_STATE,
+                                    detail=f"{where} · HID++ 0x1004", **common)
 
         index = rx.feature_index(FEATURE_BATTERY_STATUS, dev)
         if index:
             reply = rx.call(index, 0x00, dev=dev)
             if reply and len(reply) >= 7:
                 percent, status = reply[4], reply[6]
-                return BatteryState(present=True, percent=min(100, percent),
+                return BatteryState(percent=min(100, percent),
                                     charging=status in CHARGING_STATES,
-                                    full=status == FULL_STATE, name=self._name,
-                                    detail="HID++ 0x1000")
+                                    full=status == FULL_STATE,
+                                    detail=f"{where} · HID++ 0x1000", **common)
 
         index = rx.feature_index(FEATURE_BATTERY_VOLTAGE, dev)
         if index:
@@ -168,23 +270,16 @@ class MouseBattery:
                 voltage = (reply[4] << 8) | reply[5]   # big-endian mV
                 flags = reply[6] if len(reply) > 6 else 0
                 if 2500 <= voltage <= 4600:
-                    return BatteryState(present=True, percent=voltage_to_percent(voltage),
+                    return BatteryState(percent=voltage_to_percent(voltage),
                                         charging=bool(flags & 0x80),
-                                        voltage_mv=voltage, name=self._name,
-                                        detail="HID++ 0x1001")
+                                        voltage_mv=voltage,
+                                        detail=f"{where} · HID++ 0x1001", **common)
 
-        # The mouse answered the ping but exposes no battery feature, or it fell
-        # asleep between the ping and the feature calls.
-        return BatteryState(present=True, name=self._name, percent=None,
-                            detail="电量读取失败（鼠标可能休眠）")
-
-    def _drop(self):
-        if self._receiver is not None:
-            self._receiver.close()
-        self._receiver = None
-        self._key = None
-        self._device_index = None
-        self._name = ""
+        # `__init__` ran without a name yet on the very first poll
+        return BatteryState(name=slot.name, transport=slot.transport, present=True, key=key,
+                            detail=f"{where} · 电量读取失败（鼠标可能休眠）")
 
     def close(self):
-        self._drop()
+        self._slots = None
+        for key in list(self._receivers):
+            self._drop_receiver(key)

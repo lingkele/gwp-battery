@@ -1,4 +1,4 @@
-"""Desktop panel (Tkinter) for the Logitech mouse battery tray app.
+"""Desktop panel (Tkinter) for the wireless device battery tray app.
 
 Tkinter owns the main thread's event loop; the pystray icon runs in a worker
 thread and only talks to the window through a queue, so nothing here touches
@@ -10,7 +10,6 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
-import time
 import time
 import tkinter as tk
 from typing import Any
@@ -26,6 +25,9 @@ COLOR_ACCENT = "#3DDC84"
 
 UI_FONT = "Microsoft YaHei UI"
 NUM_FONT = "Segoe UI Semibold"
+
+PAGE_DETAIL = "detail"
+PAGE_DEVICES = "devices"
 
 
 def _mix(color_a: str, color_b: str, ratio: float) -> str:
@@ -93,7 +95,7 @@ class Toggle(tk.Canvas):
 
 
 class Panel:
-    """The dark window with the gauge, the sparkline and the two switches."""
+    """The dark window: a detail page with the gauge and a list of devices."""
 
     def __init__(self, app: Any) -> None:
         self.app = app
@@ -106,13 +108,18 @@ class Panel:
         self._payload: dict = {}
         self._w: dict[str, Any] = {}
         self._placed = False
+        self._page = PAGE_DETAIL
+        self._wanted_page = PAGE_DETAIL
+        self._pages: dict[str, tk.Frame] = {}
 
     # -- called from the tray thread ---------------------------------------
     def push(self, payload: dict) -> None:
         self._queue.put(payload)
 
-    def open(self) -> None:
-        self._log("open()")
+    def open(self, page: str | None = None) -> None:
+        self._log(f"open({page})")
+        if page:
+            self._wanted_page = page
         self._wanted_open = True
         self.push({})
 
@@ -171,6 +178,9 @@ class Panel:
                     self._apply(payload)
                 except Exception:
                     pass
+
+        if self._wanted_page != self._page:
+            self._set_page(self._wanted_page)
 
         if self._wanted_open and not self._visible:
             self._show()
@@ -251,6 +261,43 @@ class Panel:
         self._visible = False
         root.withdraw()
 
+    # -- pages -------------------------------------------------------------
+    def _set_page(self, name: str) -> None:
+        if name not in self._pages:
+            name = PAGE_DETAIL
+        self._page = name
+        self._wanted_page = name
+        frame = self._pages[name]
+        for other_name, other in self._pages.items():
+            if other is not frame:
+                other.pack_forget()
+        frame.pack(fill="both", expand=True)
+        self._log(f"_set_page({name})")
+
+        root = self._root
+        if root is None:
+            return
+        if self._visible:
+            # Both pages have different heights, so let Tk re-fit the window
+            # and park it back around the same top-left corner.
+            x, y = root.winfo_rootx(), root.winfo_rooty()
+            root.update_idletasks()
+            root.geometry("")
+            root.update_idletasks()
+            x = max(0, min(x, root.winfo_screenwidth() - root.winfo_reqwidth()))
+            y = max(0, min(y, root.winfo_screenheight() - root.winfo_reqheight()))
+            root.geometry(f"+{x}+{y}")
+        self._apply_current_page()
+
+    def _apply_current_page(self) -> None:
+        payload = self._payload
+        if not payload or self._root is None:
+            return
+        if self._page == PAGE_DEVICES:
+            self._fill_devices(payload)
+        else:
+            self._apply_detail(payload)
+
     # -- layout ------------------------------------------------------------
     def _build(self, root: tk.Tk) -> None:
         self._scale = self._system_scale()
@@ -264,7 +311,7 @@ class Panel:
 
         self._px, self._fs = px, fs
 
-        root.title("罗技鼠标电量")
+        root.title("设备电量")
         root.configure(bg=BG)
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -273,77 +320,9 @@ class Panel:
         except Exception:
             pass
 
-        pad = px(20)
-        tk.Frame(root, bg=BG, width=px(360), height=1).pack()  # stable width
-
-        head = tk.Frame(root, bg=BG)
-        head.pack(fill="x", padx=pad, pady=(px(16), 0))
-        name = tk.Label(head, text="罗技无线鼠标", bg=BG, fg=FG, anchor="w",
-                        font=(UI_FONT, -fs(13)), justify="left", wraplength=px(320))
-        name.pack(fill="x")
-        sub = tk.Label(head, text="正在读取…", bg=BG, fg=MUTED, anchor="w",
-                       font=(UI_FONT, -fs(9)))
-        sub.pack(fill="x", pady=(px(3), 0))
-        self._w["name"] = name
-        self._w["sub"] = sub
-
-        gauge = tk.Canvas(root, width=px(210), height=px(196), bg=BG,
-                          highlightthickness=0, bd=0)
-        gauge.pack(pady=(px(4), 0))
-        self._w["gauge"] = gauge
-
-        status = tk.Label(root, text="", bg=BG, fg=MUTED, font=(UI_FONT, -fs(10)))
-        status.pack()
-        self._w["status"] = status
-
-        detail = tk.Label(root, text="", bg=BG, fg=HINT, font=(UI_FONT, -fs(9)))
-        detail.pack(pady=(px(2), 0))
-        self._w["detail"] = detail
-
-        card = tk.Frame(root, bg=CARD)
-        card.pack(fill="x", padx=pad, pady=(px(12), 0))
-        inner = tk.Frame(card, bg=CARD)
-        inner.pack(fill="x", padx=px(12), pady=px(10))
-        tk.Label(inner, text="最近一小时电量", bg=CARD, fg=MUTED, anchor="w",
-                 font=(UI_FONT, -fs(9))).pack(fill="x")
-        chart = tk.Canvas(inner, width=px(296), height=px(84), bg=CARD,
-                          highlightthickness=0, bd=0)
-        chart.pack(fill="x", pady=(px(6), 0))
-        self._w["chart"] = chart
-
-        opts = tk.Frame(root, bg=BG)
-        opts.pack(fill="x", padx=pad, pady=(px(14), 0))
-        self._toggles: dict[str, Toggle] = {}
-        for key, text, value, command in (
-            ("low", "低电量提醒（≤15%）", True, self._on_low),
-            ("auto", "开机自动启动", False, self._on_autostart),
-        ):
-            row = tk.Frame(opts, bg=BG)
-            row.pack(fill="x", pady=px(3))
-            toggle = Toggle(row, text, value, command, width=px(38), height=px(22),
-                            font=(UI_FONT, -fs(10)), fg=FG, bg=BG,
-                            accent=COLOR_ACCENT)
-            toggle.pack(side="left")
-            toggle.label().pack(side="left", padx=(px(10), 0), fill="x", expand=True)
-            self._toggles[key] = toggle
-
-        buttons = tk.Frame(root, bg=BG)
-        buttons.pack(fill="x", padx=pad, pady=(px(12), px(4)))
-        tk.Button(buttons, text="立即刷新", command=self._on_refresh,
-                  bg=CARD_HI, fg=FG, activebackground=TRACK, activeforeground=FG,
-                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
-                  font=(UI_FONT, -fs(10)), padx=px(16), pady=px(6)).pack(side="left")
-        tk.Button(buttons, text="使用说明", command=self._on_help,
-                  bg=BG, fg=MUTED, activebackground=BG, activeforeground=FG,
-                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
-                  font=(UI_FONT, -fs(10)), padx=px(8), pady=px(6)).pack(side="left")
-        tk.Button(buttons, text="退出", command=self._on_quit,
-                  bg=BG, fg=MUTED, activebackground=BG, activeforeground=FG,
-                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
-                  font=(UI_FONT, -fs(10)), padx=px(8), pady=px(6)).pack(side="right")
-
-        tk.Label(root, text="关闭窗口后仍在托盘运行", bg=BG, fg=HINT,
-                 font=(UI_FONT, -fs(8))).pack(pady=(0, px(10)))
+        self._pages[PAGE_DETAIL] = self._build_detail(root)
+        self._pages[PAGE_DEVICES] = self._build_devices(root)
+        self._pages[PAGE_DETAIL].pack(fill="both", expand=True)
 
         self._apply(self.app.snapshot())
         root.update_idletasks()
@@ -362,6 +341,118 @@ class Panel:
 
                 dump(root)
 
+    def _build_detail(self, root: tk.Tk) -> tk.Frame:
+        px, fs = self._px, self._fs
+        page = tk.Frame(root, bg=BG)
+
+        pad = px(20)
+        tk.Frame(page, bg=BG, width=px(360), height=1).pack()  # stable width
+
+        head = tk.Frame(page, bg=BG)
+        head.pack(fill="x", padx=pad, pady=(px(16), 0))
+        name = tk.Label(head, text="正在读取…", bg=BG, fg=FG, anchor="w",
+                        font=(UI_FONT, -fs(13)), justify="left", wraplength=px(320))
+        name.pack(fill="x")
+        sub = tk.Label(head, text="正在读取…", bg=BG, fg=MUTED, anchor="w",
+                       font=(UI_FONT, -fs(9)))
+        sub.pack(fill="x", pady=(px(3), 0))
+        self._w["name"] = name
+        self._w["sub"] = sub
+
+        gauge = tk.Canvas(page, width=px(210), height=px(196), bg=BG,
+                          highlightthickness=0, bd=0)
+        gauge.pack(pady=(px(4), 0))
+        self._w["gauge"] = gauge
+
+        status = tk.Label(page, text="", bg=BG, fg=MUTED, font=(UI_FONT, -fs(10)))
+        status.pack()
+        self._w["status"] = status
+
+        detail = tk.Label(page, text="", bg=BG, fg=HINT, font=(UI_FONT, -fs(9)))
+        detail.pack(pady=(px(2), 0))
+        self._w["detail"] = detail
+
+        card = tk.Frame(page, bg=CARD)
+        card.pack(fill="x", padx=pad, pady=(px(12), 0))
+        inner = tk.Frame(card, bg=CARD)
+        inner.pack(fill="x", padx=px(12), pady=px(10))
+        tk.Label(inner, text="最近一小时电量", bg=CARD, fg=MUTED, anchor="w",
+                 font=(UI_FONT, -fs(9))).pack(fill="x")
+        chart = tk.Canvas(inner, width=px(296), height=px(84), bg=CARD,
+                          highlightthickness=0, bd=0)
+        chart.pack(fill="x", pady=(px(6), 0))
+        self._w["chart"] = chart
+
+        opts = tk.Frame(page, bg=BG)
+        opts.pack(fill="x", padx=pad, pady=(px(14), 0))
+        self._toggles: dict[str, Toggle] = {}
+        for key, text, value, command in (
+            ("low", "低电量提醒（≤15%）", True, self._on_low),
+            ("auto", "开机自动启动", False, self._on_autostart),
+        ):
+            row = tk.Frame(opts, bg=BG)
+            row.pack(fill="x", pady=px(3))
+            toggle = Toggle(row, text, value, command, width=px(38), height=px(22),
+                            font=(UI_FONT, -fs(10)), fg=FG, bg=BG,
+                            accent=COLOR_ACCENT)
+            toggle.pack(side="left")
+            toggle.label().pack(side="left", padx=(px(10), 0), fill="x", expand=True)
+            self._toggles[key] = toggle
+
+        buttons = tk.Frame(page, bg=BG)
+        buttons.pack(fill="x", padx=pad, pady=(px(12), px(4)))
+        tk.Button(buttons, text="所有设备", command=self._on_devices,
+                  bg=CARD_HI, fg=FG, activebackground=TRACK, activeforeground=FG,
+                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
+                  font=(UI_FONT, -fs(10)), padx=px(16), pady=px(6)).pack(side="left")
+        tk.Button(buttons, text="立即刷新", command=self._on_refresh,
+                  bg=BG, fg=MUTED, activebackground=BG, activeforeground=FG,
+                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
+                  font=(UI_FONT, -fs(10)), padx=px(8), pady=px(6)).pack(side="left")
+        tk.Button(buttons, text="退出", command=self._on_quit,
+                  bg=BG, fg=MUTED, activebackground=BG, activeforeground=FG,
+                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
+                  font=(UI_FONT, -fs(10)), padx=px(8), pady=px(6)).pack(side="right")
+
+        tk.Label(page, text="关闭窗口后仍在托盘运行", bg=BG, fg=HINT,
+                 font=(UI_FONT, -fs(8))).pack(pady=(0, px(10)))
+        return page
+
+    def _build_devices(self, root: tk.Tk) -> tk.Frame:
+        px, fs = self._px, self._fs
+        page = tk.Frame(root, bg=BG)
+
+        pad = px(20)
+        tk.Frame(page, bg=BG, width=px(360), height=1).pack()
+
+        head = tk.Frame(page, bg=BG)
+        head.pack(fill="x", padx=pad, pady=(px(16), 0))
+        tk.Label(head, text="所有设备", bg=BG, fg=FG, anchor="w",
+                 font=(UI_FONT, -fs(13))).pack(fill="x")
+        count = tk.Label(head, text="", bg=BG, fg=MUTED, anchor="w",
+                         font=(UI_FONT, -fs(9)))
+        count.pack(fill="x", pady=(px(3), 0))
+        self._w["count"] = count
+
+        listing = tk.Frame(page, bg=BG)
+        listing.pack(fill="both", expand=True, padx=pad, pady=(px(12), 0))
+        self._w["list"] = listing
+
+        buttons = tk.Frame(page, bg=BG)
+        buttons.pack(fill="x", padx=pad, pady=(px(10), px(4)))
+        tk.Button(buttons, text="返回", command=self._on_back,
+                  bg=CARD_HI, fg=FG, activebackground=TRACK, activeforeground=FG,
+                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
+                  font=(UI_FONT, -fs(10)), padx=px(16), pady=px(6)).pack(side="left")
+        tk.Button(buttons, text="立即刷新", command=self._on_refresh,
+                  bg=BG, fg=MUTED, activebackground=BG, activeforeground=FG,
+                  bd=0, relief="flat", highlightthickness=0, cursor="hand2",
+                  font=(UI_FONT, -fs(10)), padx=px(8), pady=px(6)).pack(side="left")
+
+        tk.Label(page, text="点击一行即可切换托盘显示", bg=BG, fg=HINT,
+                 font=(UI_FONT, -fs(8))).pack(pady=(0, px(10)))
+        return page
+
     def _window_image(self, root: tk.Tk):
         from PIL import ImageTk
 
@@ -374,17 +465,22 @@ class Panel:
         if not payload:
             return
         self._payload = payload
+        self._apply_current_page()
+
+    def _apply_detail(self, payload: dict) -> None:
         root = self._root
         px, fs = self._px, self._fs
         state = payload["state"]
         percent = state.percent
         accent = payload.get("accent") or MUTED
 
-        self._w["name"].configure(text=state.name or "罗技无线鼠标")
-        self._w["sub"].configure(text=payload.get("detail") or "HID++")
+        self._w["name"].configure(text=state.label)
+        kind = state.kind_text
+        extra = payload.get("detail") or ""
+        self._w["sub"].configure(text=f"{kind} · {extra}" if extra else kind)
         if root is not None:
-            root.title(f"罗技鼠标电量 · {percent}%" if percent is not None
-                       else "罗技鼠标电量")
+            root.title(f"设备电量 · {percent}%" if percent is not None
+                       else "设备电量")
 
         self._w["status"].configure(text=state.status_text,
                                     fg=accent if state.present else MUTED)
@@ -403,6 +499,68 @@ class Panel:
 
         self._toggles["low"].set(payload.get("notify_low", True))
         self._toggles["auto"].set(payload.get("autostart", False))
+
+    def _fill_devices(self, payload: dict) -> None:
+        px, fs = self._px, self._fs
+        root = self._root
+        devices = payload.get("devices") or []
+        current = payload.get("current")
+        if root is not None:
+            root.title("设备电量 · 所有设备")
+
+        if not devices:
+            self._w["count"].configure(text="没有找到带电池的设备")
+        else:
+            self._w["count"].configure(text=f"共 {len(devices)} 个 · 点击一行切换")
+
+        listing: tk.Frame = self._w["list"]
+        for child in listing.winfo_children():
+            child.destroy()
+        for device in devices:
+            self._device_row(listing, device, device.id == current)
+
+    def _device_row(self, parent: tk.Frame, device, selected: bool) -> None:
+        px, fs = self._px, self._fs
+        accent = device.accent
+        base = CARD_HI if selected else CARD
+        percent = device.percent
+        text = "--" if percent is None else f"{percent}%"
+
+        row = tk.Frame(parent, bg=base, cursor="hand2")
+        row.pack(fill="x", pady=(0, px(6)))
+        inner = tk.Frame(row, bg=base, cursor="hand2")
+        inner.pack(fill="x", padx=px(12), pady=px(9))
+
+        value = tk.Label(inner, text=text, bg=base, fg=accent, cursor="hand2",
+                         font=(NUM_FONT, -fs(15)))
+        value.pack(side="right", padx=(px(8), 0))
+
+        dot = tk.Canvas(inner, width=px(10), height=px(10), bg=base,
+                        highlightthickness=0, bd=0, cursor="hand2")
+        dot.create_oval(px(1), px(1), px(9), px(9), fill=accent, outline="")
+        dot.pack(side="left", padx=(0, px(10)))
+
+        block = tk.Frame(inner, bg=base, cursor="hand2")
+        block.pack(side="left", fill="x", expand=True)
+        title = tk.Label(block, text=device.label, bg=base, fg=FG, anchor="w",
+                         cursor="hand2", font=(UI_FONT, -fs(10)),
+                         wraplength=px(210), justify="left")
+        title.pack(fill="x")
+        note = tk.Label(block,
+                        text=f"{device.kind_text} · {device.status_text}",
+                        bg=base, fg=MUTED, anchor="w", cursor="hand2",
+                        font=(UI_FONT, -fs(8)))
+        note.pack(fill="x", pady=(px(2), 0))
+
+        device_id = device.id
+
+        def choose(_event=None, target=device_id) -> None:
+            self.app.select_device(target)
+            self.open(PAGE_DETAIL)
+
+        for widget in (row, inner, value, dot, block, title, note):
+            widget.bind("<Button-1>", choose)
+
     def _draw_gauge(self, percent, charging: bool, present: bool, accent: str) -> None:
         canvas: tk.Canvas = self._w["gauge"]
         canvas.delete("all")
@@ -491,6 +649,12 @@ class Panel:
     def _on_quit(self) -> None:
         self.app.quit_app()
 
+    def _on_devices(self) -> None:
+        self.open(PAGE_DEVICES)
+
+    def _on_back(self) -> None:
+        self.open(PAGE_DETAIL)
+
     def _on_low(self, value: bool) -> None:
         self.app.set_notify_low(bool(value))
 
@@ -498,7 +662,7 @@ class Panel:
         self.app.set_autostart(bool(value))
 
     def _show_help(self, text: str) -> None:
-        ctypes.windll.user32.MessageBoxW(None, text, "罗技鼠标电量 · 使用说明", 0x40)
+        ctypes.windll.user32.MessageBoxW(None, text, "设备电量 · 使用说明", 0x40)
 
     # -- dpi ---------------------------------------------------------------
     @staticmethod

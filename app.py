@@ -12,11 +12,13 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
-from gwp.battery import BatteryState, MouseBattery
+from gwp.devices import DeviceMonitor, DeviceState, pick
 from gwp.panel import Panel
+from gwp.theme import level_color
 
 APP_NAME = "GProBattery"
-APP_TITLE = "罗技鼠标电量"
+APP_TITLE = "设备电量"
+APP_VERSION = "1.2.0"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "settings.json"
@@ -35,20 +37,25 @@ FONT_CANDIDATES = [
 ]
 
 HELP_TEXT = (
+    f"{APP_TITLE} {APP_VERSION}\n\n"
     "左键单击托盘图标（或双击）打开面板，右键打开菜单。\n\n"
-    "· 面板里有大号电量表盘、最近一小时的电量曲线，以及低电量提醒、\n"
-    "  开机自启两个开关；关掉窗口后程序仍在托盘运行。\n"
-    "· 图标在任务栏右下角；如果看不到，点任务栏的 ∧ 打开隐藏图标区，\n"
-    "  把它拖到任务栏上即可常驻显示。\n"
-    "· 「开机自动启动」会写入当前用户的启动项，无需管理员权限。\n"
-    "· 直接读取接收器，无需安装 Logitech G HUB。\n\n"
-    "支持通过 Lightspeed / Bolt / Unifying 接收器连接的罗技鼠标，\n"
-    "也支持用 USB 线直连的型号。"
+    "· 面板上方可以在「详情」和「所有设备」之间切换；详情页是当前设备的\n"
+    "  大号电量表盘和最近一小时曲线，所有设备页列出每个设备的电量。\n"
+    "· 托盘右键菜单里可以直接切换要看哪个设备，图标显示的就是它。\n"
+    "· 关掉窗口后程序仍在托盘运行。图标在任务栏右下角；如果看不到，\n"
+    "  点任务栏的 ∧ 打开隐藏图标区，把它拖到任务栏上即可常驻显示。\n"
+    "· 「开机自动启动」写入当前用户的启动项，无需管理员权限。\n"
+    "· 不需要安装 Logitech G HUB。\n\n"
+    "设备来源：\n"
+    "· 罗技鼠标/键盘：直接读 Lightspeed / Bolt / Unifying 接收器，\n"
+    "  或用 USB 线直连的型号（HID++ 协议）。\n"
+    "· 蓝牙键盘/鼠标（含非罗技品牌）：读 Windows 缓存的蓝牙电池服务。"
 )
 
 
 def load_settings() -> dict:
-    defaults = {"style": "percent", "notify_low": True, "poll": 60, "first_run_done": False}
+    defaults = {"style": "percent", "notify_low": True, "poll": 60,
+                "first_run_done": False, "selected": None}
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
         if isinstance(data, dict):
@@ -66,31 +73,39 @@ def save_settings(settings: dict) -> None:
         pass
 
 
-def load_history() -> list[tuple[float, int]]:
-    """Read the stored ``[timestamp, percent]`` samples, dropping stale ones."""
+def load_history() -> dict[str, list[tuple[float, int]]]:
+    """Per-device ``[timestamp, percent]`` samples, stale ones dropped."""
     cutoff = time.time() - HISTORY_KEEP_SECONDS
-    samples: list[tuple[float, int]] = []
+    books: dict[str, list[tuple[float, int]]] = {}
     try:
         raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return samples
-    if not isinstance(raw, list):
-        return samples
-    for item in raw:
-        try:
-            ts, pct = float(item[0]), int(item[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if ts >= cutoff and 0 <= pct <= 100:
-            samples.append((ts, pct))
-    samples.sort(key=lambda sample: sample[0])
-    return samples
+        return books
+    if isinstance(raw, list):       # v1.1 wrote one unnamed device
+        raw = {"": raw}
+    if not isinstance(raw, dict):
+        return books
+    for key, items in raw.items():
+        samples: list[tuple[float, int]] = []
+        if isinstance(items, list):
+            for item in items:
+                try:
+                    ts, pct = float(item[0]), int(item[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if ts >= cutoff and 0 <= pct <= 100:
+                    samples.append((ts, pct))
+        if samples:
+            samples.sort(key=lambda sample: sample[0])
+            books[str(key)] = samples
+    return books
 
 
-def save_history(samples: list[tuple[float, int]]) -> None:
+def save_history(books: dict[str, list[tuple[float, int]]]) -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        payload = [[round(ts, 1), pct] for ts, pct in samples[-2880:]]
+        payload = {key: [[round(ts, 1), pct] for ts, pct in samples[-2880:]]
+                   for key, samples in books.items() if samples}
         HISTORY_FILE.write_text(json.dumps(payload), encoding="utf-8")
     except OSError:
         pass
@@ -125,16 +140,6 @@ def set_autostart(enabled: bool) -> None:
                 winreg.DeleteValue(key, APP_NAME)
             except FileNotFoundError:
                 pass
-
-
-def level_color(percent: int | None) -> str:
-    if percent is None:
-        return COLOR_IDLE
-    if percent <= 20:
-        return COLOR_LOW
-    if percent <= 50:
-        return COLOR_MID
-    return COLOR_GOOD
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont:
@@ -197,13 +202,15 @@ def draw_battery_icon(percent: int | None, charging: bool) -> Image.Image:
 class TrayApp:
     def __init__(self):
         self.settings = load_settings()
-        self.state = BatteryState(detail="启动中")
-        self.mouse = MouseBattery()
+        self.state = DeviceState(id="pending", detail="启动中", present=False)
+        self.monitor = DeviceMonitor()
+        self.devices: list[DeviceState] = []
+        self.selected: str | None = self.settings.get("selected") or None
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._ready = False
-        self._low_notified = False
-        self._was_full = False
+        self._low_notified: set[str] = set()
+        self._was_full: dict[str, bool] = {}
         self.history = load_history()
         self.history_writes = 0
         self.updated_at = 0.0
@@ -219,13 +226,26 @@ class TrayApp:
         state = self.state
         return {
             "state": state,
-            "history": list(self.history[-360:]),
+            "devices": list(self.devices),
+            "current": state.id,
+            "history": list(self.history.get(state.id) or []),
             "updated": self.updated_at,
             "detail": state.detail or "HID++",
             "accent": level_color(state.percent),
             "notify_low": bool(self.settings.get("notify_low", True)),
             "autostart": is_autostart_enabled(),
         }
+
+    def select_device(self, device_id: str | None) -> None:
+        """Show this device in the icon and the detail page."""
+        self.selected = device_id or None
+        self.settings["selected"] = self.selected
+        save_settings(self.settings)
+        current = pick(self.devices, self.selected)
+        if current is not None:
+            self.state = current
+        self._apply()
+        self.panel.push(self.snapshot())
 
     def refresh_now(self) -> None:
         self._wake.set()
@@ -235,7 +255,7 @@ class TrayApp:
         self._wake.set()
         save_history(self.history)
         try:
-            self.mouse.close()
+            self.monitor.close()
         except Exception:
             pass
         self.panel.stop()
@@ -250,7 +270,7 @@ class TrayApp:
     def set_notify_low(self, enabled: bool) -> None:
         self.settings["notify_low"] = bool(enabled)
         if enabled:
-            self._low_notified = False
+            self._low_notified.clear()
         save_settings(self.settings)
         self._refresh_menu()
 
@@ -274,22 +294,26 @@ class TrayApp:
         return draw_text_icon(self.state.percent, self.state.charging)
 
     def _tooltip(self) -> str:
-        name = self.state.name or "罗技无线鼠标"
-        if not self.state.present:
-            return f"{name} · 未连接（{self.state.detail}）" if self.state.name else "罗技鼠标 · 未找到接收器"
-        if self.state.percent is None:
-            return f"{name} · 电量未知（{self.state.detail}）"
-        parts = [name, f"{self.state.percent}%", self.state.status_text]
-        if self.state.voltage_mv:
-            parts.append(f"{self.state.voltage_mv} mV")
+        state = self.state
+        parts = [state.label, state.kind_text]
+        if state.percent is not None:
+            parts.append(f"{state.percent}%")
+        parts.append(state.status_text)
+        if state.voltage_mv:
+            parts.append(f"{state.voltage_mv} mV")
+        if len(self.devices) > 1:
+            parts.append(f"共 {len(self.devices)} 个设备")
         return " · ".join(parts)
 
     def _status_line(self) -> str:
-        if not self.state.present:
-            return "状态：未连接"
-        if self.state.percent is None:
-            return "状态：电量未知"
-        return f"电量：{self.state.percent}%  {self.state.status_text}"
+        state = self.state
+        if state.percent is None:
+            return f"{state.label}：{state.status_text}"
+        return f"{state.label}：{state.percent}%  {state.status_text}"
+
+    def _device_item_text(self, device: DeviceState) -> str:
+        percent = "--" if device.percent is None else f"{device.percent}%"
+        return f"{device.label}  {percent}"
 
     def _apply(self) -> None:
         if not self._ready:
@@ -305,13 +329,13 @@ class TrayApp:
     def _poll_forever(self):
         while not self._stop.is_set():
             try:
-                state = self.mouse.read()
-            except Exception as exc:  # never let the loop die
-                state = BatteryState(detail=f"读取异常：{exc}")
+                devices = self.monitor.poll()
+            except Exception:  # never let the loop die
+                devices = []
             try:
-                self._on_state(state)
+                self._on_devices(devices)
             except Exception:
-                self.state = state
+                pass
             delay = self._delay()
             self._wake.wait(delay)
             self._wake.clear()
@@ -323,40 +347,56 @@ class TrayApp:
             return 15.0
         return float(self.settings.get("poll", 60))
 
-    def _on_state(self, state: BatteryState) -> None:
-        self.state = state
+    def _on_devices(self, devices: list[DeviceState]) -> None:
+        self.devices = devices
+        current = pick(devices, self.selected)
+        if current is None:
+            current = DeviceState(id="none", detail="没有找到带电池的设备", present=False)
+        self.state = current
         self.updated_at = time.time()
-        self._record(state)
+
+        legacy = self.history.pop("", None)     # v1.1 samples had no device id
+        if legacy and current.id not in self.history:
+            self.history[current.id] = legacy
+
+        self._record(devices)
         self._apply()
-
-        if state.present and state.percent is not None:
-            if self.settings.get("notify_low", True):
-                if state.percent <= 15 and not state.charging and not self._low_notified:
-                    self._low_notified = True
-                    self.notify(f"电量只剩 {state.percent}%，该充电了", state.name or APP_TITLE)
-                elif state.percent > 20 or state.charging:
-                    self._low_notified = False
-
-            if state.full and not self._was_full:
-                self.notify("电池已充满", state.name or APP_TITLE)
-            self._was_full = state.full
-
+        self._check_alerts(current)
         self.panel.push(self.snapshot())
 
-    def _record(self, state: BatteryState) -> None:
-        if not state.present or state.percent is None:
+    def _check_alerts(self, state: DeviceState) -> None:
+        if not (state.present and state.percent is not None):
             return
+        if self.settings.get("notify_low", True):
+            if state.percent <= 15 and not state.charging and state.id not in self._low_notified:
+                self._low_notified.add(state.id)
+                self.notify(f"{state.label}电量只剩 {state.percent}%，该充电了", state.label)
+            elif state.percent > 20 or state.charging:
+                self._low_notified.discard(state.id)
+
+        if state.full and not self._was_full.get(state.id, False):
+            self.notify(f"{state.label}已充满", state.label)
+        self._was_full[state.id] = state.full
+
+    def _record(self, devices: list[DeviceState]) -> None:
         now = time.time()
-        if self.history and now - self.history[-1][0] < 20:
-            self.history[-1] = (now, state.percent)
-        else:
-            self.history.append((now, state.percent))
         cutoff = now - HISTORY_KEEP_SECONDS
-        while self.history and self.history[0][0] < cutoff:
-            self.history.pop(0)
-        self.history_writes += 1
-        if self.history_writes % 5 == 0:
-            save_history(self.history)
+        touched = False
+        for device in devices:
+            if device.percent is None:
+                continue
+            samples = self.history.setdefault(device.id, [])
+            if samples and now - samples[-1][0] < 20:
+                samples[-1] = (now, device.percent)
+            else:
+                samples.append((now, device.percent))
+            while samples and samples[0][0] < cutoff:
+                samples.pop(0)
+            touched = True
+        if touched:
+            self.history_writes += 1
+            if self.history_writes % 5 == 0:
+                save_history(self.history)
 
     def notify(self, message: str, title: str) -> None:
         try:
@@ -382,6 +422,9 @@ class TrayApp:
     def _open_panel(self, icon=None, item=None):
         self.panel.open()
 
+    def _open_devices(self, icon=None, item=None):
+        self.panel.open(page="devices")
+
     def _help(self, icon, item):
         self.show_help()
 
@@ -389,9 +432,20 @@ class TrayApp:
         self.quit_app()
 
     def _build_menu(self) -> pystray.Menu:
-        return pystray.Menu(
+        items = [
             pystray.MenuItem(lambda item: self._status_line(), None, enabled=False),
             pystray.MenuItem("打开面板", self._open_panel, default=True),
+            pystray.MenuItem("所有设备…", self._open_devices),
+        ]
+        if len(self.devices) > 1:
+            items.append(pystray.Menu.SEPARATOR)
+            for device in self.devices:
+                items.append(pystray.MenuItem(
+                    lambda item, d=device: self._device_item_text(d),
+                    lambda icon, item, d=device: self.select_device(d.id),
+                    checked=lambda item, d=device: self.state.id == d.id,
+                    radio=True))
+        items += [
             pystray.MenuItem("立即刷新", self._refresh),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示百分比", lambda i, it: self._set_style("percent"),
@@ -405,7 +459,8 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("使用说明", self._help),
             pystray.MenuItem("退出", self._quit),
-        )
+        ]
+        return pystray.Menu(*items)
 
     def run(self):
         threading.Thread(target=self._poll_forever, daemon=True).start()

@@ -1,4 +1,4 @@
-.venv/
+﻿.venv/
 __pycache__/
 *.py[cod]
 build/
@@ -8,5 +8,7 @@ dist/
 .vscode/
 *.log
 layout.txt
-panel*.png
+*.png
 !panel-demo.png
+!devices-demo.png
+!tray-demo.png
